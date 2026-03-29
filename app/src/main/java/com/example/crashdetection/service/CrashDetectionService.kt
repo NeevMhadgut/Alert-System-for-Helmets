@@ -16,11 +16,14 @@ import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import androidx.core.app.NotificationCompat
@@ -46,6 +49,10 @@ class CrashDetectionService : Service() {
         @Volatile
         var isRunning: Boolean = false
             private set
+
+        @Volatile
+        var connectionStatus: String = "Idle"
+            private set
     }
 
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
@@ -59,38 +66,50 @@ class CrashDetectionService : Service() {
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device ?: return
-            val name = result.scanRecord?.deviceName ?: device.name
-            if (name == HELMET_NAME) {
-                // Debug fallback for demos: advertising-only packet can trigger crash flow
-                // even when the peripheral does not expose the expected GATT notify characteristic.
-                if (BuildConfig.DEBUG) {
-                    maybeLaunchCrashDetectedUi()
-                }
-                stopHelmetScan()
-                connectToDevice(device)
+            if (!matchesHelmetAdvertisement(result)) return
+            connectionStatus = "Advertiser detected"
+            // Debug fallback for demos: advertising-only packet can trigger crash flow
+            // even when the peripheral does not expose the expected GATT notify characteristic.
+            if (BuildConfig.DEBUG) {
+                maybeLaunchCrashDetectedUi()
             }
+            stopHelmetScan()
+            connectToDevice(device)
         }
 
-        override fun onScanFailed(errorCode: Int) = Unit
+        override fun onScanFailed(errorCode: Int) {
+            isScanning = false
+            connectionStatus = "Scan failed ($errorCode)"
+            // Retry after transient failures (e.g. scan already started).
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (isRunning) startHelmetScan()
+            }, 2_000L)
+        }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                connectionStatus = "Connected, discovering services"
                 if (hasConnectPermission()) {
                     gatt.discoverServices()
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                connectionStatus = "Disconnected, scanning"
                 closeGatt()
                 startHelmetScan()
             }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) return
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                connectionStatus = "Service discovery failed"
+                return
+            }
             val service = gatt.getService(SMART_HELMET_SERVICE_UUID) ?: return
             val crashStatusChar = service.getCharacteristic(CRASH_STATUS_CHAR_UUID) ?: return
             enableCrashNotifications(gatt, crashStatusChar)
+            connectionStatus = "Connected and subscribed"
         }
 
         @Suppress("DEPRECATION")
@@ -101,6 +120,7 @@ class CrashDetectionService : Service() {
             if (characteristic.uuid != CRASH_STATUS_CHAR_UUID) return
             val value = characteristic.value?.firstOrNull() ?: return
             if (value == 0x01.toByte() || value == 0x02.toByte()) {
+                connectionStatus = "Crash signal received"
                 maybeLaunchCrashDetectedUi()
             }
         }
@@ -109,6 +129,7 @@ class CrashDetectionService : Service() {
     override fun onCreate() {
         super.onCreate()
         isRunning = true
+        connectionStatus = "Starting scanner"
         startForeground(NOTIFICATION_ID, createNotification())
         startHelmetScan()
     }
@@ -120,6 +141,7 @@ class CrashDetectionService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
+        connectionStatus = "Stopped"
         stopHelmetScan()
         closeGatt()
     }
@@ -148,9 +170,52 @@ class CrashDetectionService : Service() {
         val adapter = bluetoothAdapter ?: return
         if (!adapter.isEnabled) return
         if (isScanning) return
+        connectionStatus = "Scanning"
         scanner = adapter.bluetoothLeScanner
-        scanner?.startScan(scanCallback)
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+        scanner?.startScan(null, settings, scanCallback)
         isScanning = true
+    }
+
+    /**
+     * Match helmet advertiser: same name (case-insensitive), parsed local name from AD bytes,
+     * or advertised 16-bit service 0xC0DE (full UUID form on Android).
+     */
+    private fun matchesHelmetAdvertisement(result: ScanResult): Boolean {
+        val resolved = resolveAdvertisedName(result)?.trim()?.lowercase()
+        if (resolved == HELMET_NAME.lowercase()) return true
+        val uuids = result.scanRecord?.serviceUuids ?: return false
+        for (parcelUuid in uuids) {
+            if (parcelUuid.uuid == SMART_HELMET_SERVICE_UUID) return true
+        }
+        return false
+    }
+
+    private fun resolveAdvertisedName(result: ScanResult): String? {
+        result.scanRecord?.deviceName?.let { return it }
+        result.device.name?.let { return it }
+        val bytes = result.scanRecord?.bytes ?: return null
+        return parseLocalNameFromAdvertising(bytes)
+    }
+
+    private fun parseLocalNameFromAdvertising(bytes: ByteArray): String? {
+        var i = 0
+        while (i < bytes.size) {
+            val len = bytes[i].toInt() and 0xFF
+            if (len == 0) break
+            if (i + len >= bytes.size) break
+            val type = bytes[i + 1].toInt() and 0xFF
+            if ((type == 0x09 || type == 0x08) && len >= 2) {
+                val dataLen = len - 1
+                if (dataLen > 0 && i + 2 + dataLen <= bytes.size) {
+                    return String(bytes, i + 2, dataLen, Charsets.UTF_8)
+                }
+            }
+            i += 1 + len
+        }
+        return null
     }
 
     @Suppress("MissingPermission")
@@ -164,6 +229,7 @@ class CrashDetectionService : Service() {
     private fun connectToDevice(device: android.bluetooth.BluetoothDevice) {
         if (!hasConnectPermission()) return
         closeGatt()
+        connectionStatus = "Connecting to helmet"
         bluetoothGatt = device.connectGatt(this, false, gattCallback)
     }
 

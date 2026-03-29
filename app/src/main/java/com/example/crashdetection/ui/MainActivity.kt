@@ -5,6 +5,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
@@ -17,6 +19,13 @@ import com.example.crashdetection.service.CrashDetectionService
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val refreshRunnable = object : Runnable {
+        override fun run() {
+            updateUi()
+            uiHandler.postDelayed(this, 1_000L)
+        }
+    }
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -61,6 +70,12 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         updateUi()
+        uiHandler.post(refreshRunnable)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        uiHandler.removeCallbacks(refreshRunnable)
     }
 
     private fun updateUi() {
@@ -73,6 +88,8 @@ class MainActivity : AppCompatActivity() {
             }
         binding.toggleServiceButton.text =
             if (running) "Stop helmet monitoring" else "Start helmet monitoring"
+        binding.helmetConnectionText.text =
+            "Helmet connection: ${CrashDetectionService.connectionStatus}"
     }
 
     private fun isAllCriticalPermissionGranted(): Boolean {
