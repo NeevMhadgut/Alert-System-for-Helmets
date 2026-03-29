@@ -6,9 +6,11 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import com.example.crashdetection.BuildConfig
 import com.example.crashdetection.databinding.ActivityMainBinding
 import com.example.crashdetection.service.CrashDetectionService
 
@@ -40,6 +42,17 @@ class MainActivity : AppCompatActivity() {
                 data = android.net.Uri.parse("package:$packageName")
             }
             startActivity(intent)
+        }
+
+        if (BuildConfig.DEBUG) {
+            binding.simulateCrashButton.visibility = View.VISIBLE
+            binding.simulateCrashButton.setOnClickListener {
+                startActivity(
+                    Intent(this, CrashDetectedActivity::class.java).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                    }
+                )
+            }
         }
 
         updateUi()
