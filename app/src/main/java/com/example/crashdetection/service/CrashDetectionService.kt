@@ -24,6 +24,7 @@ import android.os.IBinder
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import androidx.core.app.NotificationCompat
+import com.example.crashdetection.BuildConfig
 import com.example.crashdetection.R
 import com.example.crashdetection.ui.CrashDetectedActivity
 import java.util.UUID
@@ -60,6 +61,11 @@ class CrashDetectionService : Service() {
             val device = result.device ?: return
             val name = result.scanRecord?.deviceName ?: device.name
             if (name == HELMET_NAME) {
+                // Debug fallback for demos: advertising-only packet can trigger crash flow
+                // even when the peripheral does not expose the expected GATT notify characteristic.
+                if (BuildConfig.DEBUG) {
+                    maybeLaunchCrashDetectedUi()
+                }
                 stopHelmetScan()
                 connectToDevice(device)
             }
